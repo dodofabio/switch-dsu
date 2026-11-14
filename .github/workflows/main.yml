@@ -10,6 +10,8 @@ jobs:
     container: devkitpro/devkita64:latest
     steps:
       - uses: actions/checkout@v4
+      - name: Bibliotheque JPEG
+        run: dkp-pacman -S --noconfirm --needed switch-libjpeg-turbo
       - name: Compilation
         run: make -C switch-dsu
       - name: Publier le .nro
