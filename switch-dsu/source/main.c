@@ -1,26 +1,40 @@
-// Switch DSU : transforme la Switch en manette pour Cemu (protocole DSU / cemuhook).
-// Envoie boutons, sticks, gyroscope, accéléromètre et tactile en UDP sur le port 26760.
-// Dans Cemu : Paramètres d'entrée > API "DSUController" > IP de la Switch, port 26760.
+// Switch GamePad : transforme la Switch en GamePad Wii U pour Cemu.
+// - Manette (boutons, sticks, gyroscope) : protocole DSU en UDP, port 26760.
+// - Ecran du GamePad : images JPEG recues du PC en TCP, port 26761 (programme compagnon).
+// - Tactile : les touchers sont renvoyes au PC, qui les transforme en clics dans la fenetre du GamePad.
 
 #include <switch.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <turbojpeg.h>
 
 #define DSU_PORT		26760
+#define VIDEO_PORT		26761
 #define DSU_VERSION		1001
 #define MAX_CLIENTS		4
-#define CLIENT_TIMEOUT_NS	5000000000ULL	// un client qui ne redemande rien pendant 5 s est oublié
+#define CLIENT_TIMEOUT_NS	5000000000ULL	// un client qui ne redemande rien pendant 5 s est oublie
 
 #define MSG_VERSION	0x100000
 #define MSG_PORTS	0x100001
 #define MSG_DATA	0x100002
 
-// Sens des axes : passe une valeur à -1.0f si un mouvement est inversé dans Cemu.
+#define SCREEN_W	1280
+#define SCREEN_H	720
+#define MAX_JPEG_SIZE	(2 * 1024 * 1024)
+
+// Zone morte des sticks (fraction de la course) : neutralise le drift des Joy-Con.
+#define STICK_DEADZONE	0.30f
+
+// Sens des axes : passe une valeur a -1.0f si un mouvement est inverse dans Cemu.
 #define GYRO_PITCH_SIGN	1.0f
 #define GYRO_YAW_SIGN	1.0f
 #define GYRO_ROLL_SIGN	1.0f
@@ -28,12 +42,20 @@
 #define ACCEL_Y_SIGN	1.0f
 #define ACCEL_Z_SIGN	1.0f
 
-// Un client (Cemu) qui a demandé à recevoir les données.
+// Un client DSU (Cemu) qui a demande a recevoir les donnees.
 typedef struct {
-	bool			used;		// emplacement occupé ou non
+	bool			used;		// emplacement occupe ou non
 	struct sockaddr_in	addr;		// adresse IP + port du PC
-	u64			last_request;	// instant de la dernière demande (ns)
+	u64			last_request;	// instant de la derniere demande (ns)
 } Client;
+
+// Etat partage entre la boucle principale et le fil qui recoit l'image.
+static Mutex		g_frame_lock;
+static u8		*g_frame = NULL;	// derniere image decodee, RGBA 1280x720
+static volatile bool	g_frame_ready = false;	// une nouvelle image attend d'etre affichee
+static volatile bool	g_running = true;	// passe a false pour arreter le fil video
+static volatile int	g_video_client = -1;	// connexion TCP avec le programme compagnon
+static volatile u32	g_frames_received = 0;
 
 static u32 crc_table[256];
 
@@ -65,7 +87,7 @@ static u64 now_ns(void)
 	return armTicksToNs(armGetSystemTick());
 }
 
-// En-tête commun à tous les paquets envoyés par le serveur (16 octets).
+// En-tete commun a tous les paquets DSU envoyes par le serveur (16 octets).
 static void write_header(u8 *pkt, size_t total_len, u32 server_id)
 {
 	memcpy(pkt, "DSUS", 4);
@@ -81,31 +103,166 @@ static void finish_packet(u8 *pkt, size_t total_len)
 	put_u32(pkt + 8, crc32_calc(pkt, total_len));
 }
 
-// Début commun des réponses "ports" et "données" (11 octets) : décrit la manette du slot 0.
+// Debut commun des reponses "ports" et "donnees" (12 octets) : decrit la manette du slot 0.
 static void write_slot_info(u8 *p, u8 slot, bool connected)
 {
 	p[0] = slot;
-	p[1] = connected ? 2 : 0;	// 2 = connectée
+	p[1] = connected ? 2 : 0;	// 2 = connectee
 	p[2] = connected ? 2 : 0;	// 2 = gyroscope complet
 	p[3] = connected ? 2 : 0;	// 2 = sans fil
-	memset(p + 4, 0, 6);		// adresse MAC (non utilisée)
+	memset(p + 4, 0, 6);		// adresse MAC
 	if (connected)
-		p[9] = 0xAA;		// fausse MAC non nulle pour que Cemu l'accepte
+		p[9] = 0xAA;		// fausse MAC non nulle
 	p[10] = connected ? 0x05 : 0;	// batterie : pleine
+	p[11] = connected ? 1 : 0;	// manette active
 }
 
-static u8 stick_to_u8(s32 v, bool invert)
+// Convertit un stick (-32767..32767) en octet DSU (0..255, 128 = centre), avec zone morte.
+static void stick_to_dsu(const HidAnalogStickState *s, u8 *out_x, u8 *out_y)
 {
-	s32 r = 128 + (invert ? -v : v) / 256;
-	if (r < 0) r = 0;
-	if (r > 255) r = 255;
-	return (u8)r;
+	float x = s->x / 32767.0f;
+	float y = s->y / 32767.0f;
+	float mag = sqrtf(x * x + y * y);
+	if (mag < STICK_DEADZONE) {
+		x = 0.0f;
+		y = 0.0f;
+	} else {
+		// on redistribue la course restante pour garder toute la precision
+		float scale = (mag - STICK_DEADZONE) / (1.0f - STICK_DEADZONE) / mag;
+		x *= scale;
+		y *= scale;
+	}
+	if (x > 1.0f) x = 1.0f;
+	if (x < -1.0f) x = -1.0f;
+	if (y > 1.0f) y = 1.0f;
+	if (y < -1.0f) y = -1.0f;
+	*out_x = (u8)(128.0f + x * 127.0f);
+	*out_y = (u8)(128.0f + y * 127.0f);
+}
+
+// Attend que la socket soit lisible, en verifiant regulierement si on doit s'arreter.
+static bool wait_readable(int fd)
+{
+	while (g_running) {
+		fd_set set;
+		FD_ZERO(&set);
+		FD_SET(fd, &set);
+		struct timeval tv = { 0, 100000 };	// 100 ms
+		int r = select(fd + 1, &set, NULL, NULL, &tv);
+		if (r > 0)
+			return true;
+		if (r < 0)
+			return false;
+	}
+	return false;
+}
+
+// Recoit exactement len octets (ou echoue).
+static bool recv_all(int fd, u8 *buf, size_t len)
+{
+	size_t done = 0;
+	while (done < len) {
+		if (!wait_readable(fd))
+			return false;
+		ssize_t n = recv(fd, buf + done, len - done, 0);
+		if (n <= 0)
+			return false;
+		done += (size_t)n;
+	}
+	return true;
+}
+
+// Fil qui recoit les images JPEG du PC et les decode.
+static void video_thread(void *arg)
+{
+	(void)arg;
+	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (listen_fd < 0)
+		return;
+	int yes = 1;
+	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	struct sockaddr_in local;
+	memset(&local, 0, sizeof(local));
+	local.sin_family = AF_INET;
+	local.sin_port = htons(VIDEO_PORT);
+	local.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(listen_fd, (struct sockaddr *)&local, sizeof(local)) < 0 || listen(listen_fd, 1) < 0) {
+		close(listen_fd);
+		return;
+	}
+
+	tjhandle tj = tjInitDecompress();
+	u8 *jpeg = malloc(MAX_JPEG_SIZE);
+	u8 *decoded = malloc(SCREEN_W * SCREEN_H * 4);
+
+	while (g_running && tj && jpeg && decoded) {
+		if (!wait_readable(listen_fd))
+			break;
+		int fd = accept(listen_fd, NULL, NULL);
+		if (fd < 0)
+			continue;
+		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+		g_video_client = fd;
+
+		for (;;) {
+			u8 hdr[4];
+			if (!recv_all(fd, hdr, 4))
+				break;
+			u32 size;
+			memcpy(&size, hdr, 4);
+			if (size == 0 || size > MAX_JPEG_SIZE)
+				break;
+			if (!recv_all(fd, jpeg, size))
+				break;
+
+			int w = 0, h = 0, subsamp = 0, colorspace = 0;
+			if (tjDecompressHeader3(tj, jpeg, size, &w, &h, &subsamp, &colorspace) != 0)
+				continue;
+			if (w <= 0 || h <= 0 || w > SCREEN_W || h > SCREEN_H)
+				continue;
+			if (w != SCREEN_W || h != SCREEN_H)
+				memset(decoded, 0, SCREEN_W * SCREEN_H * 4);
+			if (tjDecompress2(tj, jpeg, size, decoded, w, SCREEN_W * 4, h, TJPF_RGBA, TJFLAG_FASTDCT) != 0)
+				continue;
+
+			mutexLock(&g_frame_lock);
+			memcpy(g_frame, decoded, SCREEN_W * SCREEN_H * 4);
+			g_frame_ready = true;
+			g_frames_received++;
+			mutexUnlock(&g_frame_lock);
+		}
+
+		g_video_client = -1;
+		close(fd);
+	}
+
+	free(decoded);
+	free(jpeg);
+	if (tj)
+		tjDestroy(tj);
+	close(listen_fd);
+}
+
+// Envoie un evenement tactile au PC : type, etat (1 = appuye), x, y (ecran 1280x720).
+static void send_touch(bool down, u32 x, u32 y)
+{
+	int fd = g_video_client;
+	if (fd < 0)
+		return;
+	u8 msg[6];
+	msg[0] = 1;
+	msg[1] = down ? 1 : 0;
+	put_u16(msg + 2, (u16)x);
+	put_u16(msg + 4, (u16)y);
+	send(fd, msg, sizeof(msg), 0);
 }
 
 int main(int argc, char **argv)
 {
 	consoleInit(NULL);
 	crc_init();
+	mutexInit(&g_frame_lock);
+	g_frame = calloc(SCREEN_W * SCREEN_H, 4);
 
 	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
 	PadState pad;
@@ -122,7 +279,7 @@ int main(int argc, char **argv)
 	hidStartSixAxisSensor(h_dual[0]);
 	hidStartSixAxisSensor(h_dual[1]);
 
-	// Empêche la mise en veille automatique pendant qu'on joue sur le PC.
+	// Empeche la mise en veille automatique pendant qu'on joue sur le PC.
 	appletSetAutoSleepDisabled(true);
 	appletSetMediaPlaybackState(true);
 
@@ -143,20 +300,28 @@ int main(int argc, char **argv)
 		}
 	}
 
+	Thread vthread;
+	bool vthread_ok = false;
+	if (sock >= 0 && g_frame) {
+		if (R_SUCCEEDED(threadCreate(&vthread, video_thread, NULL, NULL, 0x40000, 0x2C, -2)))
+			vthread_ok = R_SUCCEEDED(threadStart(&vthread));
+	}
+
 	struct in_addr ip;
 	ip.s_addr = (in_addr_t)gethostid();
 
 	printf("\x1b[2J\x1b[1;1H");
-	printf("=== Switch DSU - manette pour Cemu ===\n\n");
+	printf("=== Switch GamePad - pour Cemu ===\n\n");
 	if (sock < 0) {
 		printf("ERREUR : impossible d'ouvrir le reseau.\n");
 		printf("Verifie que la Switch est connectee au Wi-Fi.\n");
 	} else {
-		printf("Dans Cemu (Parametres d'entree) :\n");
-		printf("  API      : DSUController\n");
-		printf("  IP       : %s\n", inet_ntoa(ip));
-		printf("  Port     : %d\n\n", DSU_PORT);
-		printf("Le PC et la Switch doivent etre sur le meme reseau.\n");
+		printf("Adresse IP de la Switch : %s\n\n", inet_ntoa(ip));
+		printf("Manette (Cemu, Parametres des manettes) :\n");
+		printf("  API DSUController, IP ci-dessus, port %d\n\n", DSU_PORT);
+		printf("Ecran du GamePad : lance le programme compagnon\n");
+		printf("sur le PC avec l'IP ci-dessus. L'image remplacera\n");
+		printf("ce texte des la premiere image recue.\n");
 	}
 	printf("\nQuitter : appuyer sur + et - en meme temps.\n");
 
@@ -167,11 +332,18 @@ int main(int argc, char **argv)
 	u8 rx[128];
 	u8 tx[128];
 
-	// Compteurs de diagnostic affiches a l'ecran.
-	u32 stat_version = 0, stat_ports = 0, stat_data = 0, stat_other = 0;
+	// Affichage : texte (console) au depart, puis image du GamePad.
+	bool video_mode = false;
+	Framebuffer fb;
+
+	// Diagnostic affiche tant qu'on est en mode texte.
+	u32 stat_version = 0, stat_ports = 0, stat_data = 0;
 	u32 stat_sent = 0, stat_send_err = 0;
-	char last_pc[32] = "aucun";
 	u64 last_screen = 0;
+
+	// Etat du tactile au tour precedent, pour n'envoyer que les changements.
+	bool touch_was_down = false;
+	u32 touch_last_x = 0, touch_last_y = 0;
 
 	while (appletMainLoop()) {
 		padUpdate(&pad);
@@ -181,7 +353,7 @@ int main(int argc, char **argv)
 
 		u64 t = now_ns();
 
-		// 1) Lecture des demandes de Cemu.
+		// 1) Lecture des demandes DSU de Cemu.
 		if (sock >= 0) {
 			for (;;) {
 				struct sockaddr_in from;
@@ -191,13 +363,9 @@ int main(int argc, char **argv)
 					break;
 				u32 type;
 				memcpy(&type, rx + 16, 4);
-				snprintf(last_pc, sizeof(last_pc), "%s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-				if (type == MSG_VERSION) stat_version++;
-				else if (type == MSG_PORTS) stat_ports++;
-				else if (type == MSG_DATA) stat_data++;
-				else stat_other++;
 
 				if (type == MSG_VERSION) {
+					stat_version++;
 					size_t len = 24;
 					memset(tx, 0, sizeof(tx));
 					write_header(tx, len, server_id);
@@ -206,6 +374,7 @@ int main(int argc, char **argv)
 					finish_packet(tx, len);
 					sendto(sock, tx, len, 0, (struct sockaddr *)&from, fromlen);
 				} else if (type == MSG_PORTS && n >= 24) {
+					stat_ports++;
 					s32 count;
 					memcpy(&count, rx + 20, 4);
 					if (count < 0) count = 0;
@@ -221,6 +390,7 @@ int main(int argc, char **argv)
 						sendto(sock, tx, len, 0, (struct sockaddr *)&from, fromlen);
 					}
 				} else if (type == MSG_DATA) {
+					stat_data++;
 					int free_idx = -1, found = -1;
 					for (int i = 0; i < MAX_CLIENTS; i++) {
 						if (clients[i].used && clients[i].addr.sin_addr.s_addr == from.sin_addr.s_addr
@@ -257,7 +427,17 @@ int main(int argc, char **argv)
 		memset(&touch, 0, sizeof(touch));
 		hidGetTouchScreenStates(&touch, 1);
 
-		// 3) Envoi des données aux clients enregistrés.
+		// 3) Tactile -> PC (clics dans la fenetre du GamePad).
+		bool touch_down = touch.count > 0;
+		u32 tx_pos = touch_down ? touch.touches[0].x : touch_last_x;
+		u32 ty_pos = touch_down ? touch.touches[0].y : touch_last_y;
+		if (touch_down != touch_was_down || (touch_down && (tx_pos != touch_last_x || ty_pos != touch_last_y)))
+			send_touch(touch_down, tx_pos, ty_pos);
+		touch_was_down = touch_down;
+		touch_last_x = tx_pos;
+		touch_last_y = ty_pos;
+
+		// 4) Envoi des donnees DSU aux clients enregistres.
 		if (sock >= 0) {
 			size_t len = 100;
 			memset(tx, 0, sizeof(tx));
@@ -265,7 +445,7 @@ int main(int argc, char **argv)
 			put_u32(tx + 16, MSG_DATA);
 			write_slot_info(tx + 20, 0, true);
 			u8 *d = tx + 31;
-			d[0] = 1;			// manette connectée
+			d[0] = 1;			// manette active
 			put_u32(d + 1, packet_number++);
 
 			u8 b1 = 0, b2 = 0;
@@ -288,12 +468,9 @@ int main(int argc, char **argv)
 			d[5] = b1;
 			d[6] = b2;
 			d[7] = 0;				// bouton HOME (non lisible)
-			d[8] = touch.count > 0 ? 1 : 0;		// bouton tactile
-			d[9]  = stick_to_u8(ls.x, false);
-			d[10] = stick_to_u8(ls.y, false);
-			d[11] = stick_to_u8(rs.x, false);
-			d[12] = stick_to_u8(rs.y, false);
-			// Versions analogiques (0 ou 255) : croix, boutons, gâchettes.
+			d[8] = 0;				// le tactile passe par le PC, pas par DSU
+			stick_to_dsu(&ls, &d[9], &d[10]);
+			stick_to_dsu(&rs, &d[11], &d[12]);
 			d[13] = (b1 & 0x80) ? 255 : 0;
 			d[14] = (b1 & 0x40) ? 255 : 0;
 			d[15] = (b1 & 0x20) ? 255 : 0;
@@ -306,19 +483,12 @@ int main(int argc, char **argv)
 			d[22] = (b2 & 0x04) ? 255 : 0;
 			d[23] = (b2 & 0x02) ? 255 : 0;
 			d[24] = (b2 & 0x01) ? 255 : 0;
-			// Premier point de contact tactile.
-			if (touch.count > 0) {
-				d[25] = 1;
-				d[26] = 0;
-				put_u16(d + 27, (u16)touch.touches[0].x);
-				put_u16(d + 29, (u16)touch.touches[0].y);
-			}
-			// d[31..36] : second contact, inutilisé.
+			// d[25..36] : points de contact du pave tactile, inutilises.
 			put_u64(d + 37, t / 1000);	// horodatage en microsecondes
 			put_f32(d + 45, ACCEL_X_SIGN * six.acceleration.x);
 			put_f32(d + 49, ACCEL_Y_SIGN * six.acceleration.z);
 			put_f32(d + 53, ACCEL_Z_SIGN * -six.acceleration.y);
-			// La Switch donne des tours par seconde ; le protocole attend des degrés par seconde.
+			// La Switch donne des tours par seconde ; le protocole attend des degres par seconde.
 			put_f32(d + 57, GYRO_PITCH_SIGN * six.angular_velocity.x * 360.0f);
 			put_f32(d + 61, GYRO_YAW_SIGN * six.angular_velocity.z * 360.0f);
 			put_f32(d + 65, GYRO_ROLL_SIGN * -six.angular_velocity.y * 360.0f);
@@ -338,27 +508,49 @@ int main(int argc, char **argv)
 			}
 		}
 
-		// Affichage du diagnostic, 4 fois par seconde.
-		if (t - last_screen > 250000000ULL) {
+		// 5) Affichage.
+		if (g_frame_ready) {
+			if (!video_mode) {
+				consoleExit(NULL);
+				framebufferCreate(&fb, nwindowGetDefault(), SCREEN_W, SCREEN_H, PIXEL_FORMAT_RGBA_8888, 2);
+				framebufferMakeLinear(&fb);
+				video_mode = true;
+			}
+			if (mutexTryLock(&g_frame_lock)) {
+				u32 stride;
+				u8 *dst = (u8 *)framebufferBegin(&fb, &stride);
+				for (int y = 0; y < SCREEN_H; y++)
+					memcpy(dst + y * stride, g_frame + y * SCREEN_W * 4, SCREEN_W * 4);
+				g_frame_ready = false;
+				mutexUnlock(&g_frame_lock);
+				framebufferEnd(&fb);
+			}
+		} else if (!video_mode && t - last_screen > 250000000ULL) {
 			last_screen = t;
 			int active = 0;
 			for (int i = 0; i < MAX_CLIENTS; i++)
 				if (clients[i].used) active++;
-			printf("\x1b[14;1H--- Diagnostic ---\x1b[K\n");
-			printf("Recu du PC  : version %lu | ports %lu | donnees %lu | autre %lu\x1b[K\n",
-				(unsigned long)stat_version, (unsigned long)stat_ports,
-				(unsigned long)stat_data, (unsigned long)stat_other);
-			printf("Dernier PC  : %s\x1b[K\n", last_pc);
-			printf("Clients     : %d\x1b[K\n", active);
-			printf("Envoyes     : %lu | erreurs d'envoi : %lu\x1b[K\n",
-				(unsigned long)stat_sent, (unsigned long)stat_send_err);
+			printf("\x1b[16;1H--- Diagnostic ---\x1b[K\n");
+			printf("DSU recu    : version %lu | ports %lu | donnees %lu\x1b[K\n",
+				(unsigned long)stat_version, (unsigned long)stat_ports, (unsigned long)stat_data);
+			printf("Clients DSU : %d | envoyes %lu | erreurs %lu\x1b[K\n",
+				active, (unsigned long)stat_sent, (unsigned long)stat_send_err);
+			printf("Compagnon PC: %s\x1b[K\n", g_video_client >= 0 ? "connecte" : "en attente");
 			printf("Stick G     : x=%ld y=%ld\x1b[K\n", (long)ls.x, (long)ls.y);
+			consoleUpdate(NULL);
 		}
 
-		consoleUpdate(NULL);
-		svcSleepThread(4000000);	// environ 250 envois par seconde
+		svcSleepThread(4000000);	// environ 250 tours par seconde
 	}
 
+	g_running = false;
+	if (vthread_ok) {
+		int fd = g_video_client;
+		if (fd >= 0)
+			shutdown(fd, SHUT_RDWR);
+		threadWaitForExit(&vthread);
+		threadClose(&vthread);
+	}
 	if (sock >= 0)
 		close(sock);
 	socketExit();
@@ -368,6 +560,10 @@ int main(int argc, char **argv)
 	hidStopSixAxisSensor(h_dual[1]);
 	appletSetAutoSleepDisabled(false);
 	appletSetMediaPlaybackState(false);
-	consoleExit(NULL);
+	if (video_mode)
+		framebufferClose(&fb);
+	else
+		consoleExit(NULL);
+	free(g_frame);
 	return 0;
 }
