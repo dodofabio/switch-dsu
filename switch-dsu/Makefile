@@ -5,14 +5,14 @@ endif
 include $(DEVKITPRO)/libnx/switch_rules
 
 TARGET		:= switch-dsu
-APP_TITLE	:= Switch DSU
+APP_TITLE	:= Switch GamePad
 APP_AUTHOR	:= dodofabio
 APP_VERSION	:= 1.0.0
 
 ARCH		:= -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
-CFLAGS		:= -g -Wall -O2 -ffunction-sections $(ARCH) -D__SWITCH__ -I$(DEVKITPRO)/libnx/include
-LDFLAGS		:= -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -L$(DEVKITPRO)/libnx/lib
-LIBS		:= -lnx
+CFLAGS		:= -g -Wall -O2 -ffunction-sections $(ARCH) -D__SWITCH__ -I$(DEVKITPRO)/libnx/include -I$(DEVKITPRO)/portlibs/switch/include
+LDFLAGS		:= -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -L$(DEVKITPRO)/portlibs/switch/lib -L$(DEVKITPRO)/libnx/lib
+LIBS		:= -lturbojpeg -lm -lnx
 
 TOOLS		:= $(DEVKITPRO)/tools/bin
 OFILES		:= build/main.o
