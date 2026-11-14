@@ -11,9 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Compilation
-        run: make
+        run: make -C switch-dsu
       - name: Publier le .nro
         uses: actions/upload-artifact@v4
         with:
           name: switch-dsu
-          path: switch-dsu.nro
+          path: switch-dsu/switch-dsu.nro
