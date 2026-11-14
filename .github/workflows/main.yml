@@ -1,0 +1,19 @@
+name: Compiler le .nro
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilation
+        run: make
+      - name: Publier le .nro
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch-dsu
+          path: switch-dsu.nro
