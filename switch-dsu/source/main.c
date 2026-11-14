@@ -167,6 +167,12 @@ int main(int argc, char **argv)
 	u8 rx[128];
 	u8 tx[128];
 
+	// Compteurs de diagnostic affiches a l'ecran.
+	u32 stat_version = 0, stat_ports = 0, stat_data = 0, stat_other = 0;
+	u32 stat_sent = 0, stat_send_err = 0;
+	char last_pc[32] = "aucun";
+	u64 last_screen = 0;
+
 	while (appletMainLoop()) {
 		padUpdate(&pad);
 		u64 held = padGetButtons(&pad);
@@ -185,9 +191,14 @@ int main(int argc, char **argv)
 					break;
 				u32 type;
 				memcpy(&type, rx + 16, 4);
+				snprintf(last_pc, sizeof(last_pc), "%s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+				if (type == MSG_VERSION) stat_version++;
+				else if (type == MSG_PORTS) stat_ports++;
+				else if (type == MSG_DATA) stat_data++;
+				else stat_other++;
 
 				if (type == MSG_VERSION) {
-					size_t len = 22;
+					size_t len = 24;
 					memset(tx, 0, sizeof(tx));
 					write_header(tx, len, server_id);
 					put_u32(tx + 16, MSG_VERSION);
@@ -320,8 +331,28 @@ int main(int argc, char **argv)
 					clients[i].used = false;
 					continue;
 				}
-				sendto(sock, tx, len, 0, (struct sockaddr *)&clients[i].addr, sizeof(clients[i].addr));
+				if (sendto(sock, tx, len, 0, (struct sockaddr *)&clients[i].addr, sizeof(clients[i].addr)) == (ssize_t)len)
+					stat_sent++;
+				else
+					stat_send_err++;
 			}
+		}
+
+		// Affichage du diagnostic, 4 fois par seconde.
+		if (t - last_screen > 250000000ULL) {
+			last_screen = t;
+			int active = 0;
+			for (int i = 0; i < MAX_CLIENTS; i++)
+				if (clients[i].used) active++;
+			printf("\x1b[14;1H--- Diagnostic ---\x1b[K\n");
+			printf("Recu du PC  : version %lu | ports %lu | donnees %lu | autre %lu\x1b[K\n",
+				(unsigned long)stat_version, (unsigned long)stat_ports,
+				(unsigned long)stat_data, (unsigned long)stat_other);
+			printf("Dernier PC  : %s\x1b[K\n", last_pc);
+			printf("Clients     : %d\x1b[K\n", active);
+			printf("Envoyes     : %lu | erreurs d'envoi : %lu\x1b[K\n",
+				(unsigned long)stat_sent, (unsigned long)stat_send_err);
+			printf("Stick G     : x=%ld y=%ld\x1b[K\n", (long)ls.x, (long)ls.y);
 		}
 
 		consoleUpdate(NULL);
